@@ -10,11 +10,19 @@ import {
   FileBarChart,
   Settings,
   Wallet,
+  CreditCard,
+  Shield,
+  Package,
+  CheckCircle,
 } from "lucide-react";
 
 const navItems = [
   { label: "Overview", href: "/", icon: LayoutDashboard },
   { label: "Explorer", href: "/explorer", icon: Search },
+  { label: "Cards", href: "/cards", icon: CreditCard },
+  { label: "Policies", href: "/policies", icon: Shield },
+  { label: "Programs", href: "/programs", icon: Package },
+  { label: "Approvals", href: "/approvals", icon: CheckCircle },
   { label: "Alerts", href: "/alerts", icon: Bell },
   { label: "Reports", href: "/reports", icon: FileBarChart },
   { label: "Settings", href: "/settings", icon: Settings },

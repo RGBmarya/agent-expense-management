@@ -1,5 +1,6 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import {
   BarChart,
   Bar,
@@ -18,8 +19,9 @@ import {
   recentActivity,
   summaryStats,
 } from "@/lib/mock-data";
+import { fetchOverview, fetchCards, OverviewResponse, VirtualCard } from "@/lib/api";
 import { formatCurrency, formatNumber, formatDateTime } from "@/lib/format";
-import { Activity, AlertTriangle, Settings2, Cpu } from "lucide-react";
+import { Activity, AlertTriangle, Settings2, Cpu, CreditCard } from "lucide-react";
 import clsx from "clsx";
 
 const typeIcons: Record<string, typeof Activity> = {
@@ -47,6 +49,37 @@ function BarTooltip({ active, payload, label }: { active?: boolean; payload?: { 
 }
 
 export default function OverviewPage() {
+  const [overview, setOverview] = useState<OverviewResponse | null>(null);
+  const [cards, setCards] = useState<VirtualCard[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    async function load() {
+      try {
+        const [ov, cardList] = await Promise.all([
+          fetchOverview().catch(() => null),
+          fetchCards({ status: "active" }).catch(() => []),
+        ]);
+        if (ov) setOverview(ov);
+        setCards(cardList);
+      } finally {
+        setLoading(false);
+      }
+    }
+    load();
+  }, []);
+
+  // Use API data if available, fall back to mock
+  const mtdSpend = overview?.mtd_spend_usd ?? summaryStats.mtdSpend;
+  const prevMtd = overview?.previous_mtd_spend_usd ?? summaryStats.mtdSpend * 0.85;
+  const changePercent = prevMtd > 0 ? ((mtdSpend - prevMtd) / prevMtd) * 100 : 0;
+  const trend = overview?.trend_30d?.map(t => ({ date: t.date, cost: t.total_cost_usd })) ?? dailySpendData;
+  const models = overview?.top_models?.map(m => ({ model: m.key, spend: m.total_cost_usd })) ?? topModels;
+  const teamData = overview?.top_teams?.map(t => ({ team: t.key, spend: t.total_cost_usd })) ?? topTeams;
+
+  const activeCards = cards.length;
+  const totalCardLimit = cards.reduce((s, c) => s + (c.spending_limit_usd ?? 0), 0);
+
   return (
     <div className="space-y-6">
       {/* Header */}
@@ -61,28 +94,28 @@ export default function OverviewPage() {
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <StatCard
           label="MTD Spend"
-          value={formatCurrency(summaryStats.mtdSpend)}
-          change={summaryStats.changePercent}
+          value={formatCurrency(mtdSpend)}
+          change={changePercent}
         />
         <StatCard
           label="Total Requests"
-          value={formatNumber(summaryStats.totalRequests)}
+          value={formatNumber(overview?.trend_30d?.reduce((s, t) => s + t.request_count, 0) ?? summaryStats.totalRequests)}
           subtitle="Across all models"
         />
         <StatCard
-          label="Active Models"
-          value={String(summaryStats.activeModels)}
-          subtitle="Across 3 providers"
+          label="Active Cards"
+          value={String(activeCards)}
+          subtitle={totalCardLimit > 0 ? `${formatCurrency(totalCardLimit)} total limits` : "No limits set"}
         />
         <StatCard
           label="Active Teams"
-          value={String(summaryStats.activeTeams)}
-          subtitle={`${formatCurrency(summaryStats.mtdSpend / summaryStats.activeTeams)} avg per team`}
+          value={String(overview?.top_teams?.length ?? summaryStats.activeTeams)}
+          subtitle="LLM + card spend"
         />
       </div>
 
       {/* Spend Over Time Chart */}
-      <SpendChart data={dailySpendData} />
+      <SpendChart data={trend} />
 
       {/* Bar Charts Row */}
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
@@ -94,7 +127,7 @@ export default function OverviewPage() {
           <div className="h-72">
             <ResponsiveContainer width="100%" height="100%">
               <BarChart
-                data={topModels}
+                data={models}
                 layout="vertical"
                 margin={{ top: 0, right: 10, left: 0, bottom: 0 }}
               >
@@ -129,7 +162,7 @@ export default function OverviewPage() {
           <div className="h-72">
             <ResponsiveContainer width="100%" height="100%">
               <BarChart
-                data={topTeams}
+                data={teamData}
                 layout="vertical"
                 margin={{ top: 0, right: 10, left: 0, bottom: 0 }}
               >

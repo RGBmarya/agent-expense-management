@@ -34,6 +34,7 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
     ...(init.headers as Record<string, string>),
   };
 
+  // TODO: migrate to httpOnly cookies for production
   const token = typeof window !== "undefined" ? localStorage.getItem("al_token") : null;
   if (token) headers["X-API-Key"] = token;
 
@@ -197,6 +198,202 @@ export function exportCsvUrl(params: ExplorerFilters = {}): string {
   }
   const qs = search.toString();
   return `${BASE_URL}/reports/export${qs ? `?${qs}` : ""}`;
+}
+
+// ─── Cards ──────────────────────────────────────────────────────────────────
+
+export interface VirtualCard {
+  id: string;
+  org_id: string;
+  stripe_card_id: string | null;
+  agent_id: string | null;
+  parent_card_id: string | null;
+  label: string | null;
+  status: "active" | "frozen" | "closed" | "pending";
+  card_type: "single_use" | "multi_use";
+  spending_limit_usd: number | null;
+  daily_limit_usd: number | null;
+  monthly_limit_usd: number | null;
+  allowed_mccs: string[] | null;
+  blocked_mccs: string[] | null;
+  team: string | null;
+  project: string | null;
+  environment: string | null;
+  last4: string | null;
+  exp_month: number | null;
+  exp_year: number | null;
+  spend_program_id: string | null;
+  created_at: string;
+  closed_at: string | null;
+  expires_at: string | null;
+}
+
+export interface CardBalance {
+  card_id: string;
+  spending_limit_usd: number | null;
+  total_spent_usd: number;
+  remaining_usd: number | null;
+  daily_spent_usd: number;
+  daily_limit_usd: number | null;
+  monthly_spent_usd: number;
+  monthly_limit_usd: number | null;
+}
+
+export interface CardTransaction {
+  id: string;
+  card_id: string;
+  event_id: string | null;
+  stripe_txn_id: string | null;
+  amount_usd: number;
+  merchant_name: string | null;
+  merchant_mcc: string | null;
+  merchant_city: string | null;
+  merchant_country: string | null;
+  status: string;
+  decline_reason: string | null;
+  created_at: string;
+}
+
+export interface CreateCardPayload {
+  label?: string;
+  agent_id?: string;
+  card_type?: "single_use" | "multi_use";
+  spending_limit_usd?: number;
+  daily_limit_usd?: number;
+  monthly_limit_usd?: number;
+  team?: string;
+  project?: string;
+  spend_program_id?: string;
+}
+
+export function fetchCards(params: { status?: string; agent_id?: string; team?: string; project?: string } = {}) {
+  return request<VirtualCard[]>("/cards", { params: params as Record<string, string> });
+}
+
+export function fetchCard(id: string) {
+  return request<VirtualCard>(`/cards/${id}`);
+}
+
+export function createCard(payload: CreateCardPayload) {
+  return request<VirtualCard>("/cards", { method: "POST", body: payload });
+}
+
+export function updateCard(id: string, payload: Partial<CreateCardPayload>) {
+  return request<VirtualCard>(`/cards/${id}`, { method: "PATCH", body: payload });
+}
+
+export function freezeCard(id: string) {
+  return request<VirtualCard>(`/cards/${id}/freeze`, { method: "POST" });
+}
+
+export function unfreezeCard(id: string) {
+  return request<VirtualCard>(`/cards/${id}/unfreeze`, { method: "POST" });
+}
+
+export function closeCard(id: string) {
+  return request<VirtualCard>(`/cards/${id}/close`, { method: "POST" });
+}
+
+export function fetchCardBalance(id: string) {
+  return request<CardBalance>(`/cards/${id}/balance`);
+}
+
+export function fetchCardTransactions(id: string) {
+  return request<CardTransaction[]>(`/cards/${id}/transactions`);
+}
+
+// ─── Policies ───────────────────────────────────────────────────────────────
+
+export interface SpendPolicy {
+  id: string;
+  org_id: string;
+  name: string;
+  scope: "org" | "team" | "card";
+  max_transaction_usd: number | null;
+  daily_limit_usd: number | null;
+  monthly_limit_usd: number | null;
+  allowed_mccs: string[] | null;
+  blocked_mccs: string[] | null;
+  blocked_merchants: string[] | null;
+  allowed_merchants: string[] | null;
+  require_approval_above_usd: number | null;
+  auto_close_after_first_use: boolean;
+  auto_expire_days: number | null;
+  is_default: boolean;
+  created_at: string;
+}
+
+export function fetchPolicies() {
+  return request<SpendPolicy[]>("/policies");
+}
+
+export function createPolicy(payload: Partial<SpendPolicy>) {
+  return request<SpendPolicy>("/policies", { method: "POST", body: payload });
+}
+
+export function deletePolicy(id: string) {
+  return request<void>(`/policies/${id}`, { method: "DELETE" });
+}
+
+export function attachPolicy(policyId: string, cardIds: string[]) {
+  return request<{ attached: number }>(`/policies/${policyId}/attach`, { method: "POST", body: { card_ids: cardIds } });
+}
+
+// ─── Spend Programs ─────────────────────────────────────────────────────────
+
+export interface SpendProgram {
+  id: string;
+  org_id: string;
+  name: string;
+  card_type: "single_use" | "multi_use";
+  spending_limit_usd: number | null;
+  daily_limit_usd: number | null;
+  monthly_limit_usd: number | null;
+  policy_id: string | null;
+  team: string | null;
+  project: string | null;
+  auto_expire_days: number | null;
+  is_active: boolean;
+  created_at: string;
+}
+
+export function fetchPrograms() {
+  return request<SpendProgram[]>("/programs");
+}
+
+export function createProgram(payload: Partial<SpendProgram>) {
+  return request<SpendProgram>("/programs", { method: "POST", body: payload });
+}
+
+export function issueCardFromProgram(programId: string, payload: { agent_id?: string; label?: string } = {}) {
+  return request<VirtualCard>(`/programs/${programId}/issue`, { method: "POST", body: payload });
+}
+
+// ─── Approvals ──────────────────────────────────────────────────────────────
+
+export interface ApprovalRequest {
+  id: string;
+  org_id: string;
+  card_id: string;
+  amount_usd: number;
+  merchant_name: string | null;
+  status: "pending" | "approved" | "denied";
+  requested_at: string;
+  decided_at: string | null;
+  decided_by: string | null;
+  reason: string | null;
+}
+
+export function fetchApprovals(status?: string) {
+  return request<ApprovalRequest[]>("/approvals", { params: status ? { status } : undefined });
+}
+
+export function approveRequest(id: string, reason?: string) {
+  return request<ApprovalRequest>(`/approvals/${id}/approve`, { method: "POST", body: { reason } });
+}
+
+export function denyRequest(id: string, reason?: string) {
+  return request<ApprovalRequest>(`/approvals/${id}/deny`, { method: "POST", body: { reason } });
 }
 
 // ─── Auth / API Keys ────────────────────────────────────────────────────────
