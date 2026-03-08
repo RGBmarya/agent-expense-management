@@ -113,10 +113,12 @@ def init(
         logger.warning("agentledger: config warning -- %s", w)
 
     if config.debug:
-        logging.getLogger("agentledger").setLevel(logging.DEBUG)
-        handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter("[agentledger] %(message)s"))
-        logging.getLogger("agentledger").addHandler(handler)
+        al_logger = logging.getLogger("agentledger")
+        al_logger.setLevel(logging.DEBUG)
+        if not al_logger.handlers:
+            handler = logging.StreamHandler()
+            handler.setFormatter(logging.Formatter("[agentledger] %(message)s"))
+            al_logger.addHandler(handler)
 
     # Reset any existing batcher so it picks up the new config.
     reset_batcher()

@@ -2,7 +2,7 @@
 // Typed fetch wrappers for the AgentLedger backend API.
 // In development mode these fall through to mock data; swap BASE_URL for prod.
 
-const BASE_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000/api/v1";
+const BASE_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000/v1";
 
 interface RequestOptions extends Omit<RequestInit, "body"> {
   body?: unknown;
@@ -35,7 +35,7 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   };
 
   const token = typeof window !== "undefined" ? localStorage.getItem("al_token") : null;
-  if (token) headers["Authorization"] = `Bearer ${token}`;
+  if (token) headers["X-API-Key"] = token;
 
   const res = await fetch(url, {
     ...init,
@@ -51,138 +51,164 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   return res.json() as Promise<T>;
 }
 
-// ─── Spend & Analytics ───────────────────────────────────────────────────────
+// ─── Dashboard Overview ─────────────────────────────────────────────────────
 
-export interface SpendSummary {
-  mtdSpend: number;
-  lastMonthSpend: number;
-  changePercent: number;
-  activeModels: number;
-  activeTeams: number;
-  totalRequests: number;
+export interface BreakdownItem {
+  key: string;
+  total_cost_usd: number;
+  request_count: number;
 }
 
-export interface DailySpendPoint {
+export interface TrendPoint {
   date: string;
-  total: number;
-  openai: number;
-  anthropic: number;
-  google: number;
+  total_cost_usd: number;
+  request_count: number;
 }
 
-export function fetchSummary() {
-  return request<SpendSummary>("/analytics/summary");
+export interface OverviewResponse {
+  mtd_spend_usd: number;
+  previous_mtd_spend_usd: number;
+  trend_30d: TrendPoint[];
+  top_providers: BreakdownItem[];
+  top_models: BreakdownItem[];
+  top_teams: BreakdownItem[];
 }
 
-export function fetchDailySpend(days = 30) {
-  return request<DailySpendPoint[]>("/analytics/daily-spend", { params: { days } });
-}
-
-export function fetchTopModels(limit = 8) {
-  return request<{ model: string; provider: string; spend: number; tokens: number; requests: number }[]>(
-    "/analytics/top-models",
-    { params: { limit } },
-  );
-}
-
-export function fetchTopTeams(limit = 6) {
-  return request<{ team: string; spend: number; models: number; members: number }[]>(
-    "/analytics/top-teams",
-    { params: { limit } },
-  );
+export function fetchOverview() {
+  return request<OverviewResponse>("/dashboard/overview");
 }
 
 // ─── Explorer ────────────────────────────────────────────────────────────────
 
 export interface ExplorerFilters {
-  startDate?: string;
-  endDate?: string;
+  start_date?: string;
+  end_date?: string;
   provider?: string;
   model?: string;
   team?: string;
   project?: string;
   environment?: string;
-  page?: number;
-  pageSize?: number;
+  limit?: number;
+  offset?: number;
+}
+
+export interface ExploreRow {
+  provider: string;
+  model: string;
+  team: string | null;
+  project: string | null;
+  environment: string | null;
+  total_cost_usd: number;
+  request_count: number;
+}
+
+export interface ExploreResponse {
+  rows: ExploreRow[];
+  total: number;
 }
 
 export function fetchExplorerEvents(filters: ExplorerFilters = {}) {
-  return request<{
-    events: {
-      id: string;
-      timestamp: string;
-      provider: string;
-      model: string;
-      team: string;
-      project: string;
-      environment: string;
-      inputTokens: number;
-      outputTokens: number;
-      cost: number;
-    }[];
-    total: number;
-    page: number;
-    pageSize: number;
-  }>("/events", { params: filters as Record<string, string> });
+  return request<ExploreResponse>("/dashboard/explore", {
+    params: filters as Record<string, string>,
+  });
+}
+
+// ─── Spend Over Time ────────────────────────────────────────────────────────
+
+export interface SpendTimeseriesPoint {
+  period_start: string;
+  total_cost_usd: number;
+  request_count: number;
+}
+
+export function fetchSpendOverTime(params: {
+  start_date?: string;
+  end_date?: string;
+  granularity?: "hourly" | "daily" | "monthly";
+  provider?: string;
+  model?: string;
+  team?: string;
+} = {}) {
+  return request<{ data: SpendTimeseriesPoint[]; granularity: string }>(
+    "/dashboard/spend-over-time",
+    { params: params as Record<string, string> },
+  );
 }
 
 // ─── Alerts ──────────────────────────────────────────────────────────────────
 
 export interface CreateAlertPayload {
-  name: string;
-  scope: "team" | "project" | "model";
-  scopeValue: string;
-  threshold: number;
-  period: "daily" | "weekly" | "monthly";
-  channels: string[];
+  scope: "org" | "provider" | "team" | "project" | "model";
+  scope_value: string;
+  threshold_usd: number;
+  period: "hourly" | "daily" | "monthly";
+  notify_channels?: Record<string, unknown>;
+  predictive?: boolean;
+}
+
+export interface BudgetAlertResponse {
+  id: string;
+  org_id: string;
+  scope: string;
+  scope_value: string;
+  period: string;
+  threshold_usd: number;
+  notify_channels: Record<string, unknown> | null;
+  predictive: boolean;
+  last_triggered_at: string | null;
 }
 
 export function fetchAlerts() {
-  return request<{ id: string; name: string; scope: string; scopeValue: string; threshold: number; currentSpend: number; period: string; status: string; channels: string[]; createdAt: string }[]>("/alerts");
+  return request<BudgetAlertResponse[]>("/alerts");
 }
 
 export function createAlert(payload: CreateAlertPayload) {
-  return request<{ id: string }>("/alerts", { method: "POST", body: payload });
+  return request<BudgetAlertResponse>("/alerts", { method: "POST", body: payload });
 }
 
 export function deleteAlert(id: string) {
   return request<void>(`/alerts/${id}`, { method: "DELETE" });
 }
 
+export function checkAlerts() {
+  return request<{ results: { alert_id: string; scope: string; scope_value: string; threshold_usd: number; current_spend_usd: number; pct_used: number; triggered: boolean }[] }>("/alerts/check");
+}
+
 // ─── Reports ─────────────────────────────────────────────────────────────────
 
-export function fetchDepartmentCosts(month?: string) {
-  return request<{ department: string; team: string; spend: number; tokens: number; requests: number; avgCostPerRequest: number }[]>(
-    "/reports/department-costs",
-    { params: { month } },
-  );
-}
-
-export function fetchInvoiceReconciliation() {
+export function fetchMonthlyReport(month: string) {
   return request<{
-    tracked: number;
-    invoices: { provider: string; invoiceAmount: number; trackedAmount: number; delta: number }[];
-  }>("/reports/invoice-reconciliation");
+    rows: { month: string; team: string; project: string; provider: string; total_cost_usd: number; request_count: number }[];
+    grand_total_usd: number;
+  }>("/reports/monthly", { params: { month } });
 }
 
-// ─── Settings ────────────────────────────────────────────────────────────────
+export function fetchInvoiceReconciliation(month: string, lineItems: { provider: string; invoice_amount_usd: number }[]) {
+  return request<{
+    month: string;
+    rows: { provider: string; tracked_usd: number; invoice_usd: number; difference_usd: number; pct_difference: number }[];
+  }>("/reports/invoice-reconciliation", { method: "POST", body: { month, line_items: lineItems } });
+}
+
+export function exportCsvUrl(params: ExplorerFilters = {}): string {
+  const search = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined) search.set(k, String(v));
+  }
+  const qs = search.toString();
+  return `${BASE_URL}/reports/export${qs ? `?${qs}` : ""}`;
+}
+
+// ─── Auth / API Keys ────────────────────────────────────────────────────────
 
 export function fetchApiKeys() {
-  return request<{ id: string; name: string; prefix: string; createdAt: string; lastUsed: string | null; status: string }[]>("/settings/api-keys");
+  return request<{ keys: { id: string; label: string; created_at: string; revoked_at: string | null }[] }>("/auth/keys");
 }
 
-export function createApiKey(name: string) {
-  return request<{ id: string; key: string }>("/settings/api-keys", { method: "POST", body: { name } });
+export function createApiKey(label: string) {
+  return request<{ id: string; raw_key: string; label: string; created_at: string }>("/auth/keys", { method: "POST", body: { label } });
 }
 
 export function revokeApiKey(id: string) {
-  return request<void>(`/settings/api-keys/${id}/revoke`, { method: "POST" });
-}
-
-export function fetchTeamMembers() {
-  return request<{ id: string; name: string; email: string; role: string; team: string }[]>("/settings/team-members");
-}
-
-export function updateNotificationPrefs(prefs: { email: boolean; slackWebhook: string | null }) {
-  return request<void>("/settings/notifications", { method: "PUT", body: prefs });
+  return request<void>(`/auth/keys/${id}`, { method: "DELETE" });
 }

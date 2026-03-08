@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
-from datetime import datetime, timezone
+from datetime import datetime
 from decimal import Decimal
-from typing import Optional
+from typing import AsyncIterator, Optional
 
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
@@ -16,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth import get_current_org
 from app.database import get_session
 from app.models import Event, Organization
+from app.queries import build_event_filters, cost_col, month_to_range
 from app.schemas import (
     InvoiceReconciliationRequest,
     InvoiceReconciliationResponse,
@@ -25,10 +27,6 @@ from app.schemas import (
 )
 
 router = APIRouter()
-
-
-def _cost_col():
-    return func.coalesce(Event.estimated_cost_usd, Event.amount_usd, Decimal(0))
 
 
 # ---------------------------------------------------------------------------
@@ -42,19 +40,14 @@ async def monthly_report(
     month: str = Query(..., regex=r"^\d{4}-\d{2}$", description="YYYY-MM"),
 ) -> MonthlyReportResponse:
     """Monthly cost report grouped by team, project, and provider."""
-    year, mon = map(int, month.split("-"))
-    start = datetime(year, mon, 1, tzinfo=timezone.utc)
-    if mon == 12:
-        end = datetime(year + 1, 1, 1, tzinfo=timezone.utc)
-    else:
-        end = datetime(year, mon + 1, 1, tzinfo=timezone.utc)
+    start, end = month_to_range(month)
 
     stmt = (
         select(
             func.coalesce(Event.team, "unassigned").label("team"),
             func.coalesce(Event.project, "unassigned").label("project"),
             func.coalesce(Event.provider, "unknown").label("provider"),
-            func.coalesce(func.sum(_cost_col()), Decimal(0)).label("total_cost_usd"),
+            func.coalesce(func.sum(cost_col()), Decimal(0)).label("total_cost_usd"),
             func.count().label("request_count"),
         )
         .where(
@@ -63,7 +56,7 @@ async def monthly_report(
             Event.timestamp < end,
         )
         .group_by(Event.team, Event.project, Event.provider)
-        .order_by(func.sum(_cost_col()).desc())
+        .order_by(func.sum(cost_col()).desc())
     )
     rows = (await session.execute(stmt)).all()
 
@@ -87,6 +80,14 @@ async def monthly_report(
 # GET /v1/reports/export
 # ---------------------------------------------------------------------------
 
+CSV_HEADER = [
+    "id", "timestamp", "event_type", "provider", "model",
+    "input_tokens", "output_tokens", "cached_tokens", "reasoning_tokens",
+    "latency_ms", "amount_usd", "estimated_cost_usd",
+    "team", "project", "environment", "agent_id",
+]
+
+
 @router.get("/reports/export")
 async def export_csv(
     org: Organization = Depends(get_current_org),
@@ -99,59 +100,52 @@ async def export_csv(
     project: Optional[str] = Query(None),
     environment: Optional[str] = Query(None),
 ) -> StreamingResponse:
-    """CSV export of filtered event data."""
-    filters = [Event.org_id == org.id]
-    if start_date:
-        filters.append(Event.timestamp >= start_date)
-    if end_date:
-        filters.append(Event.timestamp < end_date)
-    if provider:
-        filters.append(Event.provider == provider)
-    if model:
-        filters.append(Event.model == model)
-    if team:
-        filters.append(Event.team == team)
-    if project:
-        filters.append(Event.project == project)
-    if environment:
-        filters.append(Event.environment == environment)
+    """CSV export of filtered event data (streamed)."""
+    filters = build_event_filters(
+        org.id,
+        start_date=start_date,
+        end_date=end_date,
+        provider=provider,
+        model=model,
+        team=team,
+        project=project,
+        environment=environment,
+    )
 
     stmt = select(Event).where(*filters).order_by(Event.timestamp.desc()).limit(50_000)
     result = await session.execute(stmt)
-    events = result.scalars().all()
 
-    buf = io.StringIO()
-    writer = csv.writer(buf)
-    header = [
-        "id", "timestamp", "event_type", "provider", "model",
-        "input_tokens", "output_tokens", "cached_tokens", "reasoning_tokens",
-        "latency_ms", "amount_usd", "estimated_cost_usd",
-        "team", "project", "environment", "agent_id",
-    ]
-    writer.writerow(header)
-    for ev in events:
-        writer.writerow([
-            ev.id,
-            ev.timestamp.isoformat() if ev.timestamp else "",
-            ev.event_type.value if ev.event_type else "",
-            ev.provider,
-            ev.model,
-            ev.input_tokens,
-            ev.output_tokens,
-            ev.cached_tokens,
-            ev.reasoning_tokens,
-            ev.latency_ms,
-            str(ev.amount_usd) if ev.amount_usd is not None else "",
-            str(ev.estimated_cost_usd) if ev.estimated_cost_usd is not None else "",
-            ev.team or "",
-            ev.project or "",
-            ev.environment or "",
-            ev.agent_id or "",
-        ])
+    async def generate_csv() -> AsyncIterator[str]:
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(CSV_HEADER)
+        yield buf.getvalue()
 
-    buf.seek(0)
+        for ev in result.scalars().yield_per(500):
+            buf = io.StringIO()
+            writer = csv.writer(buf)
+            writer.writerow([
+                ev.id,
+                ev.timestamp.isoformat() if ev.timestamp else "",
+                ev.event_type.value if ev.event_type else "",
+                ev.provider,
+                ev.model,
+                ev.input_tokens,
+                ev.output_tokens,
+                ev.cached_tokens,
+                ev.reasoning_tokens,
+                ev.latency_ms,
+                str(ev.amount_usd) if ev.amount_usd is not None else "",
+                str(ev.estimated_cost_usd) if ev.estimated_cost_usd is not None else "",
+                ev.team or "",
+                ev.project or "",
+                ev.environment or "",
+                ev.agent_id or "",
+            ])
+            yield buf.getvalue()
+
     return StreamingResponse(
-        buf,
+        generate_csv(),
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=events_export.csv"},
     )
@@ -168,18 +162,13 @@ async def invoice_reconciliation(
     session: AsyncSession = Depends(get_session),
 ) -> InvoiceReconciliationResponse:
     """Compare tracked spend against manually provided invoice amounts."""
-    year, mon = map(int, body.month.split("-"))
-    start = datetime(year, mon, 1, tzinfo=timezone.utc)
-    if mon == 12:
-        end = datetime(year + 1, 1, 1, tzinfo=timezone.utc)
-    else:
-        end = datetime(year, mon + 1, 1, tzinfo=timezone.utc)
+    start, end = month_to_range(body.month)
 
     # Get tracked spend grouped by provider
     stmt = (
         select(
             Event.provider,
-            func.coalesce(func.sum(_cost_col()), Decimal(0)).label("tracked_usd"),
+            func.coalesce(func.sum(cost_col()), Decimal(0)).label("tracked_usd"),
         )
         .where(
             Event.org_id == org.id,

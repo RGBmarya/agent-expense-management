@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from decimal import Decimal
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import func, select
+from sqlalchemy import case, func, literal, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import get_current_org
 from app.database import get_session
 from app.models import BudgetAlert, Event, Organization, RollupPeriod
+from app.queries import cost_col
 from app.schemas import (
     AlertCheckResponse,
     AlertCheckResult,
@@ -23,8 +26,7 @@ from app.schemas import (
 router = APIRouter()
 
 
-def _cost_col():
-    return func.coalesce(Event.estimated_cost_usd, Event.amount_usd, Decimal(0))
+AlertScope = Literal["org", "provider", "team", "project", "model"]
 
 
 def _period_start(period: RollupPeriod) -> datetime:
@@ -132,8 +134,16 @@ async def delete_alert(
 
 
 # ---------------------------------------------------------------------------
-# GET /v1/alerts/check
+# GET /v1/alerts/check  (batched – avoids N+1)
 # ---------------------------------------------------------------------------
+
+_SCOPE_COLUMN = {
+    "provider": Event.provider,
+    "team": Event.team,
+    "project": Event.project,
+    "model": Event.model,
+}
+
 
 @router.get("/alerts/check", response_model=AlertCheckResponse)
 async def check_alerts(
@@ -145,36 +155,59 @@ async def check_alerts(
         select(BudgetAlert).where(BudgetAlert.org_id == org.id)
     )
     alerts = result.scalars().all()
+    if not alerts:
+        return AlertCheckResponse(results=[])
+
+    # Group alerts by period to batch queries
+    alerts_by_period: dict[RollupPeriod, list[BudgetAlert]] = {}
+    for alert in alerts:
+        alerts_by_period.setdefault(alert.period, []).append(alert)
+
+    # For each period, run a single query to get spend per scope
+    spend_cache: dict[tuple[str, str, str], Decimal] = {}
+
+    for period, period_alerts in alerts_by_period.items():
+        ps = _period_start(period)
+
+        # Collect unique (scope, scope_value) pairs
+        scope_pairs: set[tuple[str, str]] = set()
+        for alert in period_alerts:
+            scope_pairs.add((alert.scope, alert.scope_value))
+
+        # Build a single query for all scopes in this period
+        base_filters = [Event.org_id == org.id, Event.timestamp >= ps]
+
+        # For org-scoped alerts, get total spend
+        if any(s == "org" for s, _ in scope_pairs):
+            org_result = await session.execute(
+                select(func.coalesce(func.sum(cost_col()), Decimal(0))).where(*base_filters)
+            )
+            spend_cache[(period.value, "org", "")] = org_result.scalar_one()
+
+        # For scoped alerts, group by the scope column
+        for scope_type in ("provider", "team", "project", "model"):
+            scope_values = [sv for s, sv in scope_pairs if s == scope_type]
+            if not scope_values:
+                continue
+            col = _SCOPE_COLUMN[scope_type]
+            scoped_result = await session.execute(
+                select(
+                    col.label("scope_value"),
+                    func.coalesce(func.sum(cost_col()), Decimal(0)).label("spend"),
+                ).where(*base_filters, col.in_(scope_values)).group_by(col)
+            )
+            for row in scoped_result.all():
+                spend_cache[(period.value, scope_type, row.scope_value or "")] = row.spend
 
     results: list[AlertCheckResult] = []
     for alert in alerts:
-        ps = _period_start(alert.period)
-
-        # Build filters for scope
-        filters = [
-            Event.org_id == org.id,
-            Event.timestamp >= ps,
-        ]
-        if alert.scope == "provider":
-            filters.append(Event.provider == alert.scope_value)
-        elif alert.scope == "team":
-            filters.append(Event.team == alert.scope_value)
-        elif alert.scope == "project":
-            filters.append(Event.project == alert.scope_value)
-        elif alert.scope == "model":
-            filters.append(Event.model == alert.scope_value)
-        # scope == "org" means all events for the org
-
-        spend_result = await session.execute(
-            select(func.coalesce(func.sum(_cost_col()), Decimal(0))).where(*filters)
-        )
-        current_spend: Decimal = spend_result.scalar_one()
+        cache_key = (alert.period.value, alert.scope, alert.scope_value)
+        current_spend = spend_cache.get(cache_key, Decimal(0))
 
         threshold = alert.threshold_usd
         pct = float(current_spend / threshold * 100) if threshold else 0.0
         triggered = current_spend >= threshold
 
-        # Update last_triggered_at if newly triggered
         if triggered and alert.last_triggered_at is None:
             alert.last_triggered_at = datetime.now(timezone.utc)
 

@@ -4,32 +4,18 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
-from enum import Enum
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.models import EventType, RollupPeriod, TokenType
 
-# ---------------------------------------------------------------------------
-# Enums
-# ---------------------------------------------------------------------------
+# Re-export model enums so existing imports like `schemas.EventTypeEnum` still work.
+EventTypeEnum = EventType
+RollupPeriodEnum = RollupPeriod
+TokenTypeEnum = TokenType
 
-class EventTypeEnum(str, Enum):
-    llm_usage = "llm_usage"
-    agent_transaction = "agent_transaction"
-
-
-class RollupPeriodEnum(str, Enum):
-    hourly = "hourly"
-    daily = "daily"
-    monthly = "monthly"
-
-
-class TokenTypeEnum(str, Enum):
-    input = "input"
-    output = "output"
-    cached_input = "cached_input"
-    reasoning = "reasoning"
-
+AlertScope = Literal["org", "provider", "team", "project", "model"]
 
 # ---------------------------------------------------------------------------
 # Events
@@ -37,7 +23,7 @@ class TokenTypeEnum(str, Enum):
 
 class EventCreate(BaseModel):
     idempotency_key: str
-    event_type: EventTypeEnum
+    event_type: EventType
     provider: str
     model: str
     timestamp: datetime
@@ -57,7 +43,7 @@ class EventCreate(BaseModel):
 
 
 class EventBatchRequest(BaseModel):
-    events: list[EventCreate]
+    events: list[EventCreate] = Field(..., max_length=10_000)
 
 
 class EventResponse(BaseModel):
@@ -66,7 +52,7 @@ class EventResponse(BaseModel):
     id: str
     org_id: str
     idempotency_key: str
-    event_type: EventTypeEnum
+    event_type: EventType
     provider: str
     model: str
     timestamp: datetime
@@ -100,10 +86,16 @@ class BreakdownItem(BaseModel):
     request_count: int
 
 
+class TrendPoint(BaseModel):
+    date: str
+    total_cost_usd: float
+    request_count: int
+
+
 class OverviewResponse(BaseModel):
     mtd_spend_usd: Decimal
     previous_mtd_spend_usd: Decimal
-    trend_30d: list[dict]
+    trend_30d: list[TrendPoint]
     top_providers: list[BreakdownItem]
     top_models: list[BreakdownItem]
     top_teams: list[BreakdownItem]
@@ -134,7 +126,7 @@ class SpendTimeseriesPoint(BaseModel):
 
 class SpendOverTimeResponse(BaseModel):
     data: list[SpendTimeseriesPoint]
-    granularity: str
+    granularity: Literal["hourly", "daily", "monthly"]
 
 
 # ---------------------------------------------------------------------------
@@ -142,18 +134,18 @@ class SpendOverTimeResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 class BudgetAlertCreate(BaseModel):
-    scope: str
+    scope: AlertScope
     scope_value: str = ""
-    period: RollupPeriodEnum
+    period: RollupPeriod
     threshold_usd: Decimal
     notify_channels: dict | None = None
     predictive: bool = False
 
 
 class BudgetAlertUpdate(BaseModel):
-    scope: str | None = None
+    scope: AlertScope | None = None
     scope_value: str | None = None
-    period: RollupPeriodEnum | None = None
+    period: RollupPeriod | None = None
     threshold_usd: Decimal | None = None
     notify_channels: dict | None = None
     predictive: bool | None = None
@@ -166,7 +158,7 @@ class BudgetAlertResponse(BaseModel):
     org_id: str
     scope: str
     scope_value: str
-    period: RollupPeriodEnum
+    period: RollupPeriod
     threshold_usd: Decimal
     notify_channels: dict | None
     predictive: bool

@@ -10,6 +10,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import CostRollup, Event, RollupPeriod
+from app.queries import cost_col
 
 
 async def aggregate_rollups(
@@ -44,9 +45,7 @@ async def aggregate_rollups(
             func.coalesce(Event.team, "").label("team"),
             func.coalesce(Event.project, "").label("project"),
             func.coalesce(Event.environment, "").label("environment"),
-            func.sum(
-                func.coalesce(Event.estimated_cost_usd, Event.amount_usd, Decimal(0))
-            ).label("total_cost_usd"),
+            func.sum(cost_col()).label("total_cost_usd"),
             func.count().label("request_count"),
         )
         .where(

@@ -6,7 +6,10 @@ import asyncio
 from datetime import datetime, timezone
 from decimal import Decimal
 
+from uuid import uuid4
+
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.database import async_session_factory
 from app.models import PricingTable, TokenType
@@ -103,39 +106,32 @@ TOKEN_TYPES = [
 
 async def seed_pricing() -> int:
     """Insert pricing rows if they don't already exist. Returns count of rows created."""
-    created = 0
+    rows_to_insert = []
+    for entry in PRICING:
+        for key, ttype in TOKEN_TYPES:
+            cost = entry.get(key)
+            if cost is None:
+                continue
+            rows_to_insert.append({
+                "id": str(uuid4()),
+                "provider": entry["provider"],
+                "model": entry["model"],
+                "token_type": ttype,
+                "effective_from": EFFECTIVE_FROM,
+                "effective_to": None,
+                "cost_per_million_tokens": cost,
+            })
+
+    if not rows_to_insert:
+        return 0
+
     async with async_session_factory() as session:
-        for entry in PRICING:
-            for key, ttype in TOKEN_TYPES:
-                cost = entry.get(key)
-                if cost is None:
-                    continue
-
-                # Check existence
-                exists = await session.execute(
-                    select(PricingTable.id).where(
-                        PricingTable.provider == entry["provider"],
-                        PricingTable.model == entry["model"],
-                        PricingTable.token_type == ttype,
-                        PricingTable.effective_from == EFFECTIVE_FROM,
-                    )
-                )
-                if exists.scalar_one_or_none() is not None:
-                    continue
-
-                row = PricingTable(
-                    provider=entry["provider"],
-                    model=entry["model"],
-                    token_type=ttype,
-                    effective_from=EFFECTIVE_FROM,
-                    effective_to=None,
-                    cost_per_million_tokens=cost,
-                )
-                session.add(row)
-                created += 1
-
+        stmt = pg_insert(PricingTable).values(rows_to_insert).on_conflict_do_nothing(
+            index_elements=["provider", "model", "token_type", "effective_from"],
+        )
+        result = await session.execute(stmt)
         await session.commit()
-    return created
+        return result.rowcount  # type: ignore[return-value]
 
 
 if __name__ == "__main__":

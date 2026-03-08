@@ -13,16 +13,6 @@ export function formatNumber(value: number): string {
   return new Intl.NumberFormat("en-US").format(value);
 }
 
-export function formatCompactNumber(value: number): string {
-  if (value >= 1_000_000) {
-    return `${(value / 1_000_000).toFixed(1)}M`;
-  }
-  if (value >= 1_000) {
-    return `${(value / 1_000).toFixed(1)}K`;
-  }
-  return value.toString();
-}
-
 export function formatTokens(value: number): string {
   if (value >= 1_000_000) {
     return `${(value / 1_000_000).toFixed(2)}M`;
@@ -41,9 +31,4 @@ export function formatDate(dateStr: string, pattern: string = "MMM d, yyyy"): st
 
 export function formatDateTime(dateStr: string): string {
   return formatDate(dateStr, "MMM d, yyyy HH:mm");
-}
-
-export function formatPercent(value: number): string {
-  const sign = value >= 0 ? "+" : "";
-  return `${sign}${value.toFixed(1)}%`;
 }

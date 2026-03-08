@@ -49,6 +49,7 @@ class EventBatcher:
 
         # Background flush thread.
         self._stop_event = threading.Event()
+        self._flush_event = threading.Event()  # separate event for flush wakeup
         self._flush_thread: Optional[threading.Thread] = None
         self._started = False
 
@@ -126,18 +127,14 @@ class EventBatcher:
                 self.flush()
             except Exception:
                 logger.debug("agentledger: flush loop error", exc_info=True)
-            # Wait for the flush interval, but wake immediately if stopped.
-            self._stop_event.wait(timeout=self._config.flush_interval_s)
+            # Wait for the flush interval, but wake on flush or stop signal.
+            self._flush_event.wait(timeout=self._config.flush_interval_s)
+            self._flush_event.clear()
 
     def _trigger_flush(self) -> None:
-        """Request an immediate flush from the background thread by
-        momentarily interrupting its sleep.  If the thread hasn't started
-        yet this is a no-op (flush will happen on next enqueue).
-        """
-        # We simply interrupt the wait; the loop will call flush().
+        """Request an immediate flush from the background thread."""
         if self._flush_thread and self._flush_thread.is_alive():
-            self._stop_event.set()
-            self._stop_event.clear()
+            self._flush_event.set()
 
     # ------------------------------------------------------------------
     # Buffer helpers
@@ -173,7 +170,7 @@ class EventBatcher:
 
         url = self._config.ingest_url
         headers = {
-            "Authorization": f"Bearer {self._config.api_key}",
+            "X-API-Key": self._config.api_key,
             "Content-Type": "application/json",
             "User-Agent": "agentledger-python/0.1.0",
         }
@@ -223,6 +220,7 @@ class EventBatcher:
     def _shutdown(self) -> None:
         """Flush remaining events and tear down resources."""
         self._stop_event.set()
+        self._flush_event.set()  # wake the flush loop so it exits
         if self._flush_thread and self._flush_thread.is_alive():
             self._flush_thread.join(timeout=5.0)
         try:

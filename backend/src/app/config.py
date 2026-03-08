@@ -16,7 +16,7 @@ class Settings(BaseSettings):
 
     # --- Core ---
     DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/agentledger"
-    SECRET_KEY: str = "change-me-in-production"
+    SECRET_KEY: str  # required – no default; set via env var or .env file
     CORS_ORIGINS: list[str] = ["http://localhost:3000"]
 
     # --- SMTP (optional) ---

@@ -28,26 +28,18 @@ async def get_current_org(
     key_hash = hash_api_key(x_api_key)
 
     result = await session.execute(
-        select(ApiKey).where(
+        select(Organization)
+        .join(ApiKey, ApiKey.org_id == Organization.id)
+        .where(
             ApiKey.key_hash == key_hash,
             ApiKey.revoked_at.is_(None),
         )
     )
-    api_key = result.scalar_one_or_none()
+    org = result.scalar_one_or_none()
 
-    if api_key is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or revoked API key",
-        )
-
-    org_result = await session.execute(
-        select(Organization).where(Organization.id == api_key.org_id)
-    )
-    org = org_result.scalar_one_or_none()
     if org is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Organization not found",
+            detail="Invalid or revoked API key",
         )
     return org

@@ -60,6 +60,40 @@ def wrap_openai(client: Any) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# Shared stream interceptor base
+# ---------------------------------------------------------------------------
+
+
+class _StreamInterceptorBase:
+    """Shared init, chunk extraction, and emit logic for OpenAI stream interceptors."""
+
+    def __init__(self, stream: Any, kwargs: dict[str, Any], start: float) -> None:
+        self._stream = stream
+        self._kwargs = kwargs
+        self._start = start
+        self._final_usage: Any = None
+        self._model: Optional[str] = None
+
+    def _process_chunk(self, chunk: Any) -> None:
+        if hasattr(chunk, "model") and chunk.model:
+            self._model = chunk.model
+        if hasattr(chunk, "usage") and chunk.usage is not None:
+            self._final_usage = chunk.usage
+
+    def _emit(self, latency_ms: float) -> None:
+        if self._final_usage is not None:
+            _record_usage_from_raw(
+                usage=self._final_usage,
+                model=self._model or self._kwargs.get("model", ""),
+                kwargs=self._kwargs,
+                latency_ms=latency_ms,
+            )
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)
+
+
+# ---------------------------------------------------------------------------
 # Sync path
 # ---------------------------------------------------------------------------
 
@@ -74,13 +108,11 @@ def _patch_sync_create(completions: Any, original: Any) -> None:
         try:
             response = original(*args, **kwargs)
         except Exception:
-            # LLM calls must never be broken by our instrumentation.
             raise
 
         if stream:
             return _StreamInterceptor(response, kwargs, start)
 
-        # Non-streaming: usage is available immediately.
         latency_ms = (time.perf_counter() - start) * 1000
         _record_usage(response, kwargs, latency_ms)
         return response
@@ -89,28 +121,13 @@ def _patch_sync_create(completions: Any, original: Any) -> None:
     completions.create = wrapped_create
 
 
-class _StreamInterceptor:
-    """Wraps a synchronous OpenAI streaming response.
-
-    Transparently yields chunks to the caller while accumulating a final
-    usage snapshot from the terminal chunk (when ``stream_options``
-    includes ``{"include_usage": True}``).
-    """
-
-    def __init__(self, stream: Any, kwargs: dict[str, Any], start: float) -> None:
-        self._stream = stream
-        self._kwargs = kwargs
-        self._start = start
-        self._final_usage: Any = None
-        self._model: Optional[str] = None
+class _StreamInterceptor(_StreamInterceptorBase):
+    """Wraps a synchronous OpenAI streaming response."""
 
     def __iter__(self) -> Iterator[Any]:
         try:
             for chunk in self._stream:
-                if hasattr(chunk, "model") and chunk.model:
-                    self._model = chunk.model
-                if hasattr(chunk, "usage") and chunk.usage is not None:
-                    self._final_usage = chunk.usage
+                self._process_chunk(chunk)
                 yield chunk
         finally:
             latency_ms = (time.perf_counter() - self._start) * 1000
@@ -124,20 +141,6 @@ class _StreamInterceptor:
     def __exit__(self, *exc: Any) -> None:
         if hasattr(self._stream, "__exit__"):
             self._stream.__exit__(*exc)
-
-    # Delegate attribute access to the underlying stream so callers that
-    # inspect the response object still work.
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._stream, name)
-
-    def _emit(self, latency_ms: float) -> None:
-        if self._final_usage is not None:
-            _record_usage_from_raw(
-                usage=self._final_usage,
-                model=self._model or self._kwargs.get("model", ""),
-                kwargs=self._kwargs,
-                latency_ms=latency_ms,
-            )
 
 
 # ---------------------------------------------------------------------------
@@ -168,23 +171,13 @@ def _patch_async_create(completions: Any, original: Any) -> None:
     completions.create = wrapped_create
 
 
-class _AsyncStreamInterceptor:
+class _AsyncStreamInterceptor(_StreamInterceptorBase):
     """Async counterpart of :class:`_StreamInterceptor`."""
-
-    def __init__(self, stream: Any, kwargs: dict[str, Any], start: float) -> None:
-        self._stream = stream
-        self._kwargs = kwargs
-        self._start = start
-        self._final_usage: Any = None
-        self._model: Optional[str] = None
 
     async def __aiter__(self) -> AsyncIterator[Any]:
         try:
             async for chunk in self._stream:
-                if hasattr(chunk, "model") and chunk.model:
-                    self._model = chunk.model
-                if hasattr(chunk, "usage") and chunk.usage is not None:
-                    self._final_usage = chunk.usage
+                self._process_chunk(chunk)
                 yield chunk
         finally:
             latency_ms = (time.perf_counter() - self._start) * 1000
@@ -198,18 +191,6 @@ class _AsyncStreamInterceptor:
     async def __aexit__(self, *exc: Any) -> None:
         if hasattr(self._stream, "__aexit__"):
             await self._stream.__aexit__(*exc)
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._stream, name)
-
-    def _emit(self, latency_ms: float) -> None:
-        if self._final_usage is not None:
-            _record_usage_from_raw(
-                usage=self._final_usage,
-                model=self._model or self._kwargs.get("model", ""),
-                kwargs=self._kwargs,
-                latency_ms=latency_ms,
-            )
 
 
 # ---------------------------------------------------------------------------

@@ -65,40 +65,12 @@ def wrap_anthropic(client: Any) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# Sync create
+# Shared stream interceptor logic (sync + async)
 # ---------------------------------------------------------------------------
 
 
-def _patch_sync_create(messages: Any, original: Any) -> None:
-    """Replace ``messages.create`` with a synchronous wrapper."""
-
-    @functools.wraps(original)
-    def wrapped_create(*args: Any, **kwargs: Any) -> Any:
-        start = time.perf_counter()
-        stream = kwargs.get("stream", False)
-        try:
-            response = original(*args, **kwargs)
-        except Exception:
-            raise
-
-        if stream:
-            return _StreamInterceptor(response, kwargs, start)
-
-        latency_ms = (time.perf_counter() - start) * 1000
-        _record_usage(response, kwargs, latency_ms)
-        return response
-
-    wrapped_create._agentledger_wrapped = True  # type: ignore[attr-defined]
-    messages.create = wrapped_create
-
-
-class _StreamInterceptor:
-    """Wraps a synchronous Anthropic streaming response.
-
-    Accumulates the ``message_start`` and ``message_delta`` events to build a
-    complete usage picture, then emits a single :class:`UsageEvent` when the
-    stream closes.
-    """
+class _StreamInterceptorBase:
+    """Shared init, extract, and emit logic for stream interceptors."""
 
     def __init__(self, stream: Any, kwargs: dict[str, Any], start: float) -> None:
         self._stream = stream
@@ -109,27 +81,6 @@ class _StreamInterceptor:
         self._cached_tokens: int = 0
         self._cache_creation_tokens: int = 0
         self._model: Optional[str] = None
-
-    def __iter__(self) -> Iterator[Any]:
-        try:
-            for event in self._stream:
-                self._extract_from_event(event)
-                yield event
-        finally:
-            latency_ms = (time.perf_counter() - self._start) * 1000
-            self._emit(latency_ms)
-
-    def __enter__(self) -> _StreamInterceptor:
-        if hasattr(self._stream, "__enter__"):
-            self._stream.__enter__()
-        return self
-
-    def __exit__(self, *exc: Any) -> None:
-        if hasattr(self._stream, "__exit__"):
-            self._stream.__exit__(*exc)
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._stream, name)
 
     def _extract_from_event(self, event: Any) -> None:
         """Pull usage data from Anthropic streaming events."""
@@ -165,6 +116,59 @@ class _StreamInterceptor:
                 kwargs=self._kwargs,
                 latency_ms=latency_ms,
             )
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)
+
+
+# ---------------------------------------------------------------------------
+# Sync create
+# ---------------------------------------------------------------------------
+
+
+def _patch_sync_create(messages: Any, original: Any) -> None:
+    """Replace ``messages.create`` with a synchronous wrapper."""
+
+    @functools.wraps(original)
+    def wrapped_create(*args: Any, **kwargs: Any) -> Any:
+        start = time.perf_counter()
+        stream = kwargs.get("stream", False)
+        try:
+            response = original(*args, **kwargs)
+        except Exception:
+            raise
+
+        if stream:
+            return _StreamInterceptor(response, kwargs, start)
+
+        latency_ms = (time.perf_counter() - start) * 1000
+        _record_usage(response, kwargs, latency_ms)
+        return response
+
+    wrapped_create._agentledger_wrapped = True  # type: ignore[attr-defined]
+    messages.create = wrapped_create
+
+
+class _StreamInterceptor(_StreamInterceptorBase):
+    """Wraps a synchronous Anthropic streaming response."""
+
+    def __iter__(self) -> Iterator[Any]:
+        try:
+            for event in self._stream:
+                self._extract_from_event(event)
+                yield event
+        finally:
+            latency_ms = (time.perf_counter() - self._start) * 1000
+            self._emit(latency_ms)
+
+    def __enter__(self) -> _StreamInterceptor:
+        if hasattr(self._stream, "__enter__"):
+            self._stream.__enter__()
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        if hasattr(self._stream, "__exit__"):
+            self._stream.__exit__(*exc)
 
 
 # ---------------------------------------------------------------------------
@@ -254,18 +258,8 @@ def _patch_async_create(messages: Any, original: Any) -> None:
     messages.create = wrapped_create
 
 
-class _AsyncStreamInterceptor:
+class _AsyncStreamInterceptor(_StreamInterceptorBase):
     """Async counterpart of :class:`_StreamInterceptor`."""
-
-    def __init__(self, stream: Any, kwargs: dict[str, Any], start: float) -> None:
-        self._stream = stream
-        self._kwargs = kwargs
-        self._start = start
-        self._input_tokens: int = 0
-        self._output_tokens: int = 0
-        self._cached_tokens: int = 0
-        self._cache_creation_tokens: int = 0
-        self._model: Optional[str] = None
 
     async def __aiter__(self) -> AsyncIterator[Any]:
         try:
@@ -284,44 +278,6 @@ class _AsyncStreamInterceptor:
     async def __aexit__(self, *exc: Any) -> None:
         if hasattr(self._stream, "__aexit__"):
             await self._stream.__aexit__(*exc)
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._stream, name)
-
-    def _extract_from_event(self, event: Any) -> None:
-        """Pull usage data from Anthropic streaming events."""
-        event_type = getattr(event, "type", "")
-
-        if event_type == "message_start":
-            message = getattr(event, "message", None)
-            if message:
-                self._model = getattr(message, "model", None)
-                usage = getattr(message, "usage", None)
-                if usage:
-                    self._input_tokens = getattr(usage, "input_tokens", 0) or 0
-                    self._cached_tokens = (
-                        getattr(usage, "cache_read_input_tokens", 0) or 0
-                    )
-                    self._cache_creation_tokens = (
-                        getattr(usage, "cache_creation_input_tokens", 0) or 0
-                    )
-
-        elif event_type == "message_delta":
-            usage = getattr(event, "usage", None)
-            if usage:
-                self._output_tokens = getattr(usage, "output_tokens", 0) or 0
-
-    def _emit(self, latency_ms: float) -> None:
-        if self._input_tokens or self._output_tokens:
-            _record_usage_from_raw(
-                input_tokens=self._input_tokens,
-                output_tokens=self._output_tokens,
-                cached_tokens=self._cached_tokens,
-                cache_creation_tokens=self._cache_creation_tokens,
-                model=self._model or self._kwargs.get("model", ""),
-                kwargs=self._kwargs,
-                latency_ms=latency_ms,
-            )
 
 
 # ---------------------------------------------------------------------------

@@ -25,7 +25,7 @@ services:
       - "8000:8000"
     environment:
       DATABASE_URL: postgresql+asyncpg://agentledger:agentledger@db:5432/agentledger
-      SECRET_KEY: dev-secret-key-change-in-production
+      SECRET_KEY: ${SECRET_KEY:?Set SECRET_KEY in your environment or .env file}
       CORS_ORIGINS: '["http://localhost:3000"]'
     depends_on:
       db:
@@ -40,7 +40,7 @@ services:
     ports:
       - "3000:3000"
     environment:
-      NEXT_PUBLIC_API_URL: http://localhost:8000
+      NEXT_PUBLIC_API_URL: http://localhost:8000/v1
     depends_on:
       - backend
     volumes:

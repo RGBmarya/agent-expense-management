@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import func, select
@@ -13,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth import get_current_org
 from app.database import get_session
 from app.models import Event, Organization
+from app.queries import build_event_filters, cost_col
 from app.schemas import (
     BreakdownItem,
     ExploreResponse,
@@ -20,14 +22,10 @@ from app.schemas import (
     OverviewResponse,
     SpendOverTimeResponse,
     SpendTimeseriesPoint,
+    TrendPoint,
 )
 
 router = APIRouter()
-
-
-def _cost_col() -> func.coalesce:
-    """Return a coalesce expression preferring estimated_cost_usd then amount_usd."""
-    return func.coalesce(Event.estimated_cost_usd, Event.amount_usd, Decimal(0))
 
 
 # ---------------------------------------------------------------------------
@@ -50,58 +48,17 @@ async def dashboard_overview(
         prev_mtd_start = mtd_start.replace(month=now.month - 1)
     prev_mtd_end = prev_mtd_start + (now - mtd_start)
 
-    # MTD spend
-    mtd_result = await session.execute(
-        select(func.coalesce(func.sum(_cost_col()), Decimal(0))).where(
-            Event.org_id == org.id,
-            Event.timestamp >= mtd_start,
-        )
-    )
-    mtd_spend = mtd_result.scalar_one()
-
-    # Previous MTD
-    prev_result = await session.execute(
-        select(func.coalesce(func.sum(_cost_col()), Decimal(0))).where(
-            Event.org_id == org.id,
-            Event.timestamp >= prev_mtd_start,
-            Event.timestamp < prev_mtd_end,
-        )
-    )
-    prev_mtd_spend = prev_result.scalar_one()
-
-    # 30-day daily trend
-    thirty_days_ago = now - timedelta(days=30)
-    trend_stmt = (
-        select(
-            func.date_trunc("day", Event.timestamp).label("day"),
-            func.coalesce(func.sum(_cost_col()), Decimal(0)).label("total_cost_usd"),
-            func.count().label("request_count"),
-        )
-        .where(Event.org_id == org.id, Event.timestamp >= thirty_days_ago)
-        .group_by("day")
-        .order_by("day")
-    )
-    trend_rows = (await session.execute(trend_stmt)).all()
-    trend_30d = [
-        {
-            "date": row.day.isoformat() if row.day else "",
-            "total_cost_usd": float(row.total_cost_usd),
-            "request_count": row.request_count,
-        }
-        for row in trend_rows
-    ]
-
     # Top breakdowns helper
     async def _top(col, limit: int = 5) -> list[BreakdownItem]:
         stmt = (
             select(
                 col.label("key"),
-                func.coalesce(func.sum(_cost_col()), Decimal(0)).label("total_cost_usd"),
+                func.coalesce(func.sum(cost_col()), Decimal(0)).label("total_cost_usd"),
                 func.count().label("request_count"),
             )
             .where(Event.org_id == org.id, Event.timestamp >= mtd_start)
             .group_by(col)
-            .order_by(func.sum(_cost_col()).desc())
+            .order_by(func.sum(cost_col()).desc())
             .limit(limit)
         )
         rows = (await session.execute(stmt)).all()
@@ -114,13 +71,71 @@ async def dashboard_overview(
             for r in rows
         ]
 
+    # Run independent queries concurrently
+    async def _mtd_spend() -> Decimal:
+        result = await session.execute(
+            select(func.coalesce(func.sum(cost_col()), Decimal(0))).where(
+                Event.org_id == org.id,
+                Event.timestamp >= mtd_start,
+            )
+        )
+        return result.scalar_one()
+
+    async def _prev_mtd_spend() -> Decimal:
+        result = await session.execute(
+            select(func.coalesce(func.sum(cost_col()), Decimal(0))).where(
+                Event.org_id == org.id,
+                Event.timestamp >= prev_mtd_start,
+                Event.timestamp < prev_mtd_end,
+            )
+        )
+        return result.scalar_one()
+
+    async def _trend_30d() -> list[TrendPoint]:
+        thirty_days_ago = now - timedelta(days=30)
+        trend_stmt = (
+            select(
+                func.date_trunc("day", Event.timestamp).label("day"),
+                func.coalesce(func.sum(cost_col()), Decimal(0)).label("total_cost_usd"),
+                func.count().label("request_count"),
+            )
+            .where(Event.org_id == org.id, Event.timestamp >= thirty_days_ago)
+            .group_by("day")
+            .order_by("day")
+        )
+        rows = (await session.execute(trend_stmt)).all()
+        return [
+            TrendPoint(
+                date=row.day.isoformat() if row.day else "",
+                total_cost_usd=float(row.total_cost_usd),
+                request_count=row.request_count,
+            )
+            for row in rows
+        ]
+
+    (
+        mtd_spend,
+        prev_mtd_spend,
+        trend_30d,
+        top_providers,
+        top_models,
+        top_teams,
+    ) = await asyncio.gather(
+        _mtd_spend(),
+        _prev_mtd_spend(),
+        _trend_30d(),
+        _top(Event.provider),
+        _top(Event.model),
+        _top(Event.team),
+    )
+
     return OverviewResponse(
         mtd_spend_usd=mtd_spend,
         previous_mtd_spend_usd=prev_mtd_spend,
         trend_30d=trend_30d,
-        top_providers=await _top(Event.provider),
-        top_models=await _top(Event.model),
-        top_teams=await _top(Event.team),
+        top_providers=top_providers,
+        top_models=top_models,
+        top_teams=top_teams,
     )
 
 
@@ -143,21 +158,16 @@ async def dashboard_explore(
     offset: int = Query(0, ge=0),
 ) -> ExploreResponse:
     """Filterable drill-down grouped by provider/model/team/project/environment."""
-    filters = [Event.org_id == org.id]
-    if start_date:
-        filters.append(Event.timestamp >= start_date)
-    if end_date:
-        filters.append(Event.timestamp < end_date)
-    if provider:
-        filters.append(Event.provider == provider)
-    if model:
-        filters.append(Event.model == model)
-    if team:
-        filters.append(Event.team == team)
-    if project:
-        filters.append(Event.project == project)
-    if environment:
-        filters.append(Event.environment == environment)
+    filters = build_event_filters(
+        org.id,
+        start_date=start_date,
+        end_date=end_date,
+        provider=provider,
+        model=model,
+        team=team,
+        project=project,
+        environment=environment,
+    )
 
     group_cols = [Event.provider, Event.model, Event.team, Event.project, Event.environment]
 
@@ -179,12 +189,12 @@ async def dashboard_explore(
             Event.team,
             Event.project,
             Event.environment,
-            func.coalesce(func.sum(_cost_col()), Decimal(0)).label("total_cost_usd"),
+            func.coalesce(func.sum(cost_col()), Decimal(0)).label("total_cost_usd"),
             func.count().label("request_count"),
         )
         .where(*filters)
         .group_by(*group_cols)
-        .order_by(func.sum(_cost_col()).desc())
+        .order_by(func.sum(cost_col()).desc())
         .limit(limit)
         .offset(offset)
     )
@@ -217,7 +227,7 @@ async def spend_over_time(
     session: AsyncSession = Depends(get_session),
     start_date: Optional[datetime] = Query(None),
     end_date: Optional[datetime] = Query(None),
-    granularity: str = Query("daily", regex="^(hourly|daily|monthly)$"),
+    granularity: Literal["hourly", "daily", "monthly"] = Query("daily"),
     provider: Optional[str] = Query(None),
     model: Optional[str] = Query(None),
     team: Optional[str] = Query(None),
@@ -229,24 +239,21 @@ async def spend_over_time(
     if end_date is None:
         end_date = now
 
-    filters = [
-        Event.org_id == org.id,
-        Event.timestamp >= start_date,
-        Event.timestamp < end_date,
-    ]
-    if provider:
-        filters.append(Event.provider == provider)
-    if model:
-        filters.append(Event.model == model)
-    if team:
-        filters.append(Event.team == team)
+    filters = build_event_filters(
+        org.id,
+        start_date=start_date,
+        end_date=end_date,
+        provider=provider,
+        model=model,
+        team=team,
+    )
 
     trunc = func.date_trunc(granularity if granularity != "daily" else "day", Event.timestamp)
 
     stmt = (
         select(
             trunc.label("period_start"),
-            func.coalesce(func.sum(_cost_col()), Decimal(0)).label("total_cost_usd"),
+            func.coalesce(func.sum(cost_col()), Decimal(0)).label("total_cost_usd"),
             func.count().label("request_count"),
         )
         .where(*filters)

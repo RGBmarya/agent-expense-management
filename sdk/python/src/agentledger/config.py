@@ -59,7 +59,7 @@ class AgentLedgerConfig:
     @property
     def ingest_url(self) -> str:
         """Full URL for the event ingest endpoint."""
-        return f"{self.endpoint.rstrip('/')}/v1/events/ingest"
+        return f"{self.endpoint.rstrip('/')}/v1/events"
 
     def validate(self) -> list[str]:
         """Return a list of validation warnings (empty when config is valid)."""
