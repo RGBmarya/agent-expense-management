@@ -9,7 +9,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import AsyncIterator, Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,6 +18,7 @@ from app.auth import get_current_org
 from app.database import get_session
 from app.models import Event, Organization
 from app.queries import build_event_filters, cost_col, month_to_range
+from app.rate_limit import limiter
 from app.schemas import (
     InvoiceReconciliationRequest,
     InvoiceReconciliationResponse,
@@ -37,7 +38,7 @@ router = APIRouter()
 async def monthly_report(
     org: Organization = Depends(get_current_org),
     session: AsyncSession = Depends(get_session),
-    month: str = Query(..., regex=r"^\d{4}-\d{2}$", description="YYYY-MM"),
+    month: str = Query(..., pattern=r"^\d{4}-\d{2}$", description="YYYY-MM"),
 ) -> MonthlyReportResponse:
     """Monthly cost report grouped by team, project, and provider."""
     start, end = month_to_range(month)
@@ -89,7 +90,9 @@ CSV_HEADER = [
 
 
 @router.get("/reports/export")
+@limiter.limit("10/minute")
 async def export_csv(
+    request: Request,
     org: Organization = Depends(get_current_org),
     session: AsyncSession = Depends(get_session),
     start_date: Optional[datetime] = Query(None),

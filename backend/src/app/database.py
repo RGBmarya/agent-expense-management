@@ -12,12 +12,11 @@ from sqlalchemy.ext.asyncio import (
 
 from app.config import settings
 
-engine = create_async_engine(
-    settings.DATABASE_URL,
-    echo=False,
-    pool_size=20,
-    max_overflow=10,
-)
+_engine_kwargs: dict = {"echo": False}
+if settings.DATABASE_URL.startswith("postgresql"):
+    _engine_kwargs.update(pool_size=20, max_overflow=10)
+
+engine = create_async_engine(settings.DATABASE_URL, **_engine_kwargs)
 
 async_session_factory = async_sessionmaker(
     engine,

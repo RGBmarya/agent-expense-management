@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import secrets
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import get_current_org, hash_api_key
 from app.database import get_session
+from app.rate_limit import limiter
 from app.models import ApiKey, Organization
 from app.schemas import (
     ApiKeyCreateRequest,
@@ -22,7 +23,9 @@ router = APIRouter()
 
 
 @router.post("/auth/keys", response_model=ApiKeyCreateResponse, status_code=201)
+@limiter.limit("20/minute")
 async def create_api_key(
+    request: Request,
     body: ApiKeyCreateRequest,
     org: Organization = Depends(get_current_org),
     session: AsyncSession = Depends(get_session),
@@ -48,7 +51,9 @@ async def create_api_key(
 
 
 @router.get("/auth/keys", response_model=ApiKeyListResponse)
+@limiter.limit("20/minute")
 async def list_api_keys(
+    request: Request,
     org: Organization = Depends(get_current_org),
     session: AsyncSession = Depends(get_session),
 ) -> ApiKeyListResponse:
@@ -65,7 +70,9 @@ async def list_api_keys(
 
 
 @router.delete("/auth/keys/{key_id}", status_code=204)
+@limiter.limit("20/minute")
 async def revoke_api_key(
+    request: Request,
     key_id: str,
     org: Organization = Depends(get_current_org),
     session: AsyncSession = Depends(get_session),

@@ -101,9 +101,13 @@ async def update_alert(
     if alert is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Alert not found")
 
+    _ALERT_UPDATABLE_FIELDS = {
+        "scope", "scope_value", "period", "threshold_usd", "notify_channels", "predictive",
+    }
     update_data = body.model_dump(exclude_unset=True)
     for field, value in update_data.items():
-        setattr(alert, field, value)
+        if field in _ALERT_UPDATABLE_FIELDS:
+            setattr(alert, field, value)
 
     await session.flush()
     return BudgetAlertResponse.model_validate(alert)
